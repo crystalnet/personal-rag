@@ -1,0 +1,35 @@
+# Python virtual environment
+.venv/
+venv/
+env/
+.env
+
+# Docs containing input data
+docs/
+
+# Python bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Distribution / packaging
+dist/
+build/
+*.egg-info/
+
+# IDE specific files
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Environment variables
+.env
+.env.local
+
+# Logs
+*.log
+
+# OS specific
+.DS_Store
+Thumbs.db 
