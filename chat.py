@@ -1,5 +1,5 @@
-from llama_index.core import VectorStoreIndex
-from llama_index.vector_stores.pinecone import PineconeVectorStore
+from langchain.vectorstores import Pinecone
+from langchain.embeddings import OpenAIEmbeddings
 from dotenv import load_dotenv
 import os
 from pinecone import Pinecone
@@ -23,13 +23,18 @@ index = pc.Index(index_name)
 stats = index.describe_index_stats()
 print(f"📊 Index stats: {stats}")
 
-vector_store = PineconeVectorStore(
+# Initialize embeddings
+embeddings = OpenAIEmbeddings(model="text-embedding-3-large")
+
+# Load vector store
+vector_store = Pinecone.from_existing_index(
     index_name=index_name,
-    api_key=os.getenv("PINECONE_API_KEY"),
+    embedding=embeddings,
+    api_key=os.getenv("PINECONE_API_KEY")
 )
 
-index = VectorStoreIndex.from_vector_store(vector_store)
-chat_engine = index.as_chat_engine(
+# Create chat engine
+chat_engine = vector_store.as_chat_engine(
     chat_mode="condense_plus_context",
     streaming=True,          # streams tokens for snappy UX
 )
