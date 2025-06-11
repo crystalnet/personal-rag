@@ -18,17 +18,48 @@ import ssl
 import time
 import hashlib
 from pathlib import Path
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Tuple
 from dataclasses import dataclass
+from queue import Queue
+from threading import Thread, Event
+import traceback
+import logging
+from datetime import datetime
 
 # Load environment variables at the start
 load_dotenv()
+
+# Set up logging
+def setup_logging():
+    """Configure logging to write to both file and console."""
+    # Create logs directory if it doesn't exist
+    log_dir = Path("logs")
+    log_dir.mkdir(exist_ok=True)
+    
+    # Create a timestamp for the log file
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    log_file = log_dir / f"embedder_{timestamp}.log"
+    
+    # Configure logging
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(levelname)s - %(message)s',
+        handlers=[
+            logging.FileHandler(log_file),
+            logging.StreamHandler()  # This will still show logs in terminal
+        ]
+    )
+    
+    return logging.getLogger(__name__)
+
+# Initialize logger
+logger = setup_logging()
 
 class RobustTextLoader(TextLoader):
     """A text loader that handles different encodings."""
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        print(f"🔍 RobustTextLoader initialized for: {self.file_path}")
+        logger.info(f"RobustTextLoader initialized for: {self.file_path}")
 
     def load(self):
         try:
@@ -39,7 +70,7 @@ class RobustTextLoader(TextLoader):
                 with open(self.file_path, "r", encoding="latin-1") as f:
                     text = f.read()
             except Exception as e:
-                print(f"❌ Skipping {self.file_path}: cannot decode as UTF-8 or Latin-1 ({e})")
+                logger.error(f"Skipping {self.file_path}: cannot decode as UTF-8 or Latin-1 ({e})")
                 return []
 
         return [Document(page_content=text, metadata={"source": str(self.file_path)})]
@@ -87,6 +118,29 @@ class DocumentEmbedder:
         self.index_name = os.getenv("PINECONE_INDEX_NAME")
         self.embeddings = OpenAIEmbeddings(model="text-embedding-3-large")
         self._validate_pinecone_index()
+        
+        # Initialize queues
+        self.read_queue = Queue()
+        self.chunk_queue = Queue()
+        self.embed_queue = Queue()
+        
+        # Initialize error tracking
+        self.error_event = Event()
+        self.errors = []
+        
+        # Initialize text splitter
+        self.text_splitter = RecursiveCharacterTextSplitter(
+            chunk_size=self.config.chunk_size,
+            chunk_overlap=self.config.chunk_overlap,
+        )
+        
+        # Initialize progress tracking
+        self.total_files = 0
+        self.files_read = 0
+        self.files_chunked = 0
+        self.total_chunks = 0
+        self.chunks_embedded = 0
+        self.chunks_uploaded = 0
 
     def _setup_nltk(self) -> None:
         """Set up NLTK punkt data."""
@@ -122,56 +176,199 @@ class DocumentEmbedder:
         else:
             return None
 
-    def _load_documents(self, directory: str, glob_patterns: str) -> List[Any]:
-        """Load documents from the specified directory using multiple glob patterns."""
-        print(f"Loading documents from {directory} with patterns: {glob_patterns}")
+    def _handle_error(self, error: Exception, stage: str, context: str = ""):
+        """Handle errors in the pipeline."""
+        error_msg = f"Error in {stage}: {str(error)}\nContext: {context}\n{traceback.format_exc()}"
+        print(f"❌ {error_msg}")
+        self.errors.append(error_msg)
+        self.error_event.set()
 
-        # Check if directory exists
-        if not os.path.exists(directory):
-            raise ValueError(f"Directory does not exist: {directory}")
-            
-        # Parse glob patterns from environment variable
-        patterns = [p.strip() for p in glob_patterns.split(',')]
-            
-        all_docs = []
-        for pattern in patterns:
-            print(f"\n🔍 Searching with pattern: {pattern}")
-            matching_files = list(Path(directory).glob(pattern))
-            print(f"📁 Found {len(matching_files)} files with pattern {pattern}:")
-            
-            if matching_files:
-                print(f"\n📥 Loading documents...")
-                loader_class = self._get_loader_for_pattern(pattern)
-                if loader_class is None:
-                    print(f"⚠️  No specific loader found for pattern {pattern}, using default loader")
-                    loader = DirectoryLoader(directory, glob=pattern)
-                else:
-                    print(f"✅ Using {loader_class.__name__} for {pattern}")
-                    loader = DirectoryLoader(directory, glob=pattern, loader_cls=loader_class)
-                
-                docs = loader.load()
-                if docs:
-                    all_docs.extend(docs)
-                    print(f"✅ Successfully loaded {len(docs)} documents with pattern {pattern}")
+    def _print_progress(self):
+        """Print current progress across all stages."""
+        # Clear previous lines and move to start
+        print("\033[2K\033[1A" * 3, end="")  # Clear 3 lines and move up
+        print("\033[K", end="")  # Clear current line
         
-        if not all_docs:
-            raise ValueError(f"No documents were loaded successfully from directory '{directory}'")
+        # Print progress information
+        print(f"📊 Progress:")
+        print(f"  Files: {self.files_read}/{self.total_files} read, "
+              f"{self.files_chunked}/{self.total_files} chunked")
+        if self.total_chunks > 0:
+            print(f"  Chunks: {self.chunks_embedded}/{self.total_chunks} embedded "
+                  f"({(self.chunks_embedded/self.total_chunks)*100:.1f}%), "
+                  f"{self.chunks_uploaded}/{self.total_chunks} uploaded "
+                  f"({(self.chunks_uploaded/self.total_chunks)*100:.1f}%)")
         
-        print(f"\n📊 Total documents loaded: {len(all_docs)}")
-        return all_docs
+        # Flush to ensure immediate display
+        import sys
+        sys.stdout.flush()
 
-    def _chunk_documents(self, docs: List[Any]) -> List[Any]:
-        """Split documents into chunks."""
-        print("\n✂️  Chunking documents...")
-        text_splitter = RecursiveCharacterTextSplitter(
-            chunk_size=self.config.chunk_size,
-            chunk_overlap=self.config.chunk_overlap,
-        )
-        
-        chunked_docs = text_splitter.split_documents(docs)
-        print(f"✅ Split documents into {len(chunked_docs)} chunks")
-        print(f"   Using chunk size: {self.config.chunk_size}, overlap: {self.config.chunk_overlap}")
-        return chunked_docs
+    def _reader_worker(self, file_paths: List[Path]):
+        """Read documents and add them to the chunking queue."""
+        try:
+            self.total_files = len(file_paths)
+            
+            for file_path in file_paths:
+                try:
+                    # Get the appropriate loader for this file
+                    loader_class = self._get_loader_for_pattern(file_path.name)
+                    if not loader_class:
+                        print(f"\n⚠️  No loader found for {file_path}")
+                        continue
+                    
+                    # Load the document
+                    loader = loader_class(str(file_path))
+                    docs = loader.load()
+                    
+                    # Add to chunking queue
+                    self.read_queue.put((file_path, docs))
+                    self.files_read += 1
+                    self._print_progress()
+                    
+                except Exception as e:
+                    error_msg = f"Error reading {file_path}: {str(e)}"
+                    print(f"\n❌ {error_msg}")
+                    self.errors.append(error_msg)
+                    self.error_event.set()
+            
+            # Signal end of reading
+            self.read_queue.put(None)
+            
+        except Exception as e:
+            print(f"\n❌ Fatal error in reader: {str(e)}")
+            self.error_event.set()
+            self.read_queue.put(None)  # Signal end even if there's an error
+
+    def _chunker_worker(self):
+        """Worker for chunking documents."""
+        try:
+            while True:
+                if self.error_event.is_set():
+                    break
+                    
+                item = self.read_queue.get()
+                if item is None:  # End signal
+                    self.read_queue.task_done()
+                    break
+                    
+                file_path, docs = item
+                try:
+                    chunks = self.text_splitter.split_documents(docs)
+                    self.total_chunks += len(chunks)
+                    self.chunk_queue.put((file_path, chunks))
+                    self.files_chunked += 1
+                    self._print_progress()
+                except Exception as e:
+                    self._handle_error(e, "chunker", f"Failed to chunk {file_path}")
+                finally:
+                    self.read_queue.task_done()
+        finally:
+            self.chunk_queue.put(None)  # Signal end of chunking
+
+    def _embedder_worker(self):
+        """Worker for embedding documents."""
+        try:
+            logger.info("Starting embedder worker...")
+            batch_count = 0
+            while True:
+                if self.error_event.is_set():
+                    logger.error("Embedder worker stopping due to error event")
+                    break
+                    
+                item = self.chunk_queue.get()
+                if item is None:  # End signal
+                    logger.info("Embedder worker received end signal")
+                    self.chunk_queue.task_done()
+                    break
+                    
+                file_path, chunks = item
+                try:
+                    # Process chunks in batches
+                    for i in range(0, len(chunks), self.config.batch_size):
+                        batch = chunks[i:i + self.config.batch_size]
+                        batch_count += 1
+                        logger.info(f"Embedding batch {batch_count} from {file_path} ({len(batch)} chunks)")
+                        vectors = self.embeddings.embed_documents([doc.page_content for doc in batch])
+                        logger.info(f"Batch {batch_count} embedded successfully")
+                        self.embed_queue.put((file_path, batch, vectors))
+                        self.chunks_embedded += len(batch)
+                        self._print_progress()
+                except Exception as e:
+                    logger.error(f"Error embedding batch from {file_path}: {str(e)}")
+                    self._handle_error(e, "embedder", f"Failed to embed {file_path}")
+                finally:
+                    self.chunk_queue.task_done()
+        except Exception as e:
+            logger.error(f"Fatal error in embedder worker: {str(e)}")
+            self._handle_error(e, "embedder", "Fatal error in embedder worker")
+        finally:
+            logger.info("Embedder worker finished")
+            self.embed_queue.put(None)  # Signal end of embedding
+
+    def _uploader_worker(self):
+        """Worker for uploading to Pinecone."""
+        try:
+            logger.info("Starting uploader worker...")
+            vector_store = PineconeVectorStore(
+                index=self.pc.Index(self.index_name),
+                embedding=self.embeddings
+            )
+            
+            batch_count = 0
+            while True:
+                if self.error_event.is_set():
+                    logger.error("Uploader worker stopping due to error event")
+                    break
+                    
+                item = self.embed_queue.get()
+                if item is None:  # End signal
+                    logger.info("Uploader worker received end signal")
+                    self.embed_queue.task_done()
+                    break
+                    
+                file_path, chunks, vectors = item
+                try:
+                    # Start with configured batch size
+                    current_batch_size = self.config.batch_size
+                    for i in range(0, len(chunks), current_batch_size):
+                        batch = chunks[i:i + current_batch_size]
+                        batch_count += 1
+                        batch_ids = [self._make_deterministic_id(doc, i + j) for j, doc in enumerate(batch)]
+                        
+                        try:
+                            logger.info(f"Uploading batch {batch_count} from {file_path} ({len(batch)} chunks)")
+                            vector_store.add_documents(documents=batch, ids=batch_ids)
+                            logger.info(f"Batch {batch_count} uploaded successfully")
+                            self.chunks_uploaded += len(batch)
+                            self._print_progress()
+                        except Exception as e:
+                            if "Request size" in str(e) and "exceeds the maximum supported size" in str(e):
+                                logger.warning(f"Batch too large ({current_batch_size}), reducing size and retrying...")
+                                current_batch_size = current_batch_size // 2
+                                if current_batch_size < 1:
+                                    raise Exception("Cannot reduce batch size further")
+                                i -= current_batch_size  # Retry the same batch with smaller size
+                                continue
+                            else:
+                                raise
+                except Exception as e:
+                    logger.error(f"Error uploading batch from {file_path}: {str(e)}")
+                    self._handle_error(e, "uploader", f"Failed to upload {file_path}")
+                finally:
+                    self.embed_queue.task_done()
+        except Exception as e:
+            logger.error(f"Fatal error in uploader worker: {str(e)}")
+            self._handle_error(e, "uploader", "Fatal error in uploader worker")
+        finally:
+            logger.info("Uploader worker finished")
+            # Ensure we signal end of processing even if there's an error
+            try:
+                while not self.embed_queue.empty():
+                    self.embed_queue.get()
+                    self.embed_queue.task_done()
+            except:
+                pass
+            self.embed_queue.put(None)  # Signal end of uploading
 
     def _make_deterministic_id(self, doc: Any, chunk_index: int) -> str:
         """Generate a deterministic ID for a document chunk."""
@@ -180,66 +377,64 @@ class DocumentEmbedder:
         base = f"{Path(source).as_posix()}-{chunk_index}-{content.strip()}"
         return hashlib.sha256(base.encode("utf-8")).hexdigest()
 
-    def _upload_to_pinecone(self, chunked_docs: List[Any]) -> None:
-        """Upload documents to Pinecone with verification."""
-        print("\n📤 Adding documents to vector store...")
-        
-        # Create vector store
-        vector_store = PineconeVectorStore(
-            index=self.pc.Index(self.index_name),
-            embedding=self.embeddings
-        )
-
-        # Get initial stats
-        initial_stats = self.pc.Index(self.index_name).describe_index_stats()
-        print(f"📊 Initial index stats: {initial_stats}")
-
-        # Process documents in batches
-        total_chunks = len(chunked_docs)
-        print(f"📦 Processing {total_chunks} chunks in batches of {self.config.batch_size}")
-        
-        for i in range(0, total_chunks, self.config.batch_size):
-            batch = chunked_docs[i:i + self.config.batch_size]
-            batch_ids = [self._make_deterministic_id(doc, i + j) for j, doc in enumerate(batch)]
-            
-            print(f"\n🔄 Processing batch {i//self.config.batch_size + 1}/{(total_chunks + self.config.batch_size - 1)//self.config.batch_size}")
-            print(f"   Chunks {i+1}-{min(i+self.config.batch_size, total_chunks)} of {total_chunks}")
-            
-            try:
-                vector_store.add_documents(documents=batch, ids=batch_ids)
-                print(f"✅ Successfully uploaded batch")
-            except Exception as e:
-                print(f"❌ Error uploading batch: {str(e)}")
-                raise
-
-        self._verify_upload(initial_stats)
-
-    def _verify_upload(self, initial_stats: Dict[str, Any]) -> None:
-        """Verify that documents were successfully uploaded."""
-        print("\n🔄 Verifying upload...")
-        print(f"   Using max retries: {self.config.max_retries}, delay: {self.config.retry_delay}s")
-
-        for attempt in range(self.config.max_retries):
-            time.sleep(self.config.retry_delay)
-            final_stats = self.pc.Index(self.index_name).describe_index_stats()
-            print(f"📊 Stats check {attempt + 1}/{self.config.max_retries}: {final_stats}")
-            
-            if final_stats['total_vector_count'] > initial_stats['total_vector_count']:
-                print("✅ Documents successfully uploaded to Pinecone!")
-                return
-            elif attempt < self.config.max_retries - 1:
-                print(f"⏳ Waiting for index to update... (attempt {attempt + 1}/{self.config.max_retries})")
-        
-        print("❌ Warning: No new vectors were added to Pinecone after multiple checks. Please verify the upload manually.")
-
     def process_documents(self, directory: str, glob_patterns: str) -> None:
-        """Process and upload documents from the specified directory."""
+        """Process and upload documents using a pipelined approach."""
         try:
-            docs = self._load_documents(directory, glob_patterns)
-            chunked_docs = self._chunk_documents(docs)
-            self._upload_to_pinecone(chunked_docs)
+            # Get all matching files
+            patterns = [p.strip() for p in glob_patterns.split(',')]
+            all_files = []
+            for pattern in patterns:
+                matching_files = list(Path(directory).glob(pattern))
+                all_files.extend(matching_files)
+            
+            if not all_files:
+                raise ValueError(f"No files found in {directory} matching patterns: {glob_patterns}")
+            
+            # Set total files once
+            self.total_files = len(all_files)
+            print(f"📁 Found {self.total_files} files to process")
+            # Add blank lines for progress display
+            print("\n")
+            
+            # Start worker threads
+            chunker_thread = Thread(target=self._chunker_worker, daemon=True)
+            embedder_thread = Thread(target=self._embedder_worker, daemon=True)
+            uploader_thread = Thread(target=self._uploader_worker, daemon=True)
+            
+            chunker_thread.start()
+            embedder_thread.start()
+            uploader_thread.start()
+            
+            # Start reading in main thread
+            self._reader_worker(all_files)
+            
+            # Wait for all queues to be processed
+            self.read_queue.join()
+            self.chunk_queue.join()
+            self.embed_queue.join()
+            
+            # Print final newline after progress
+            print("\n")
+            
+            # Check for errors
+            if self.error_event.is_set():
+                print("\n❌ Errors occurred during processing:")
+                for error in self.errors:
+                    print(f"\n{error}")
+                raise Exception("Document processing failed due to errors in the pipeline")
+            
+            print("\n✅ All documents processed successfully!")
+            
         except Exception as e:
-            print(f"❌ Error: {str(e)}")
+            print(f"\n❌ Fatal error: {str(e)}")
+            # Ensure we clean up any remaining items in queues
+            for queue in [self.read_queue, self.chunk_queue, self.embed_queue]:
+                try:
+                    while not queue.empty():
+                        queue.get()
+                        queue.task_done()
+                except:
+                    pass
             raise
 
 def main():
