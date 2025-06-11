@@ -11,7 +11,7 @@ from langgraph.graph import START, StateGraph
 from langchain_core.messages import HumanMessage, AIMessage
 
 # Load environment variables at the start
-load_dotenv()
+load_dotenv(override=True)
 
 @dataclass
 class ChatConfig:

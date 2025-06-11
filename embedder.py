@@ -9,6 +9,7 @@ from langchain_community.document_loaders import (
     UnstructuredExcelLoader
 )
 from langchain_openai import OpenAIEmbeddings
+from langchain_huggingface import HuggingFaceEmbeddings
 from pinecone import Pinecone
 from langchain_pinecone import PineconeVectorStore
 from langchain.text_splitter import RecursiveCharacterTextSplitter
@@ -27,7 +28,7 @@ import logging
 from datetime import datetime
 
 # Load environment variables at the start
-load_dotenv()
+load_dotenv(override=True)
 
 # Set up logging
 def setup_logging():
@@ -46,7 +47,6 @@ def setup_logging():
         format='%(asctime)s - %(levelname)s - %(message)s',
         handlers=[
             logging.FileHandler(log_file),
-            logging.StreamHandler()  # This will still show logs in terminal
         ]
     )
     
@@ -94,9 +94,8 @@ class EmbedderConfig:
     """Configuration for the document embedder."""
     chunk_size: int
     chunk_overlap: int
-    max_retries: int
-    retry_delay: int
     batch_size: int
+    embedding_model: str  # Add embedding model configuration
 
     @classmethod
     def from_env(cls) -> 'EmbedderConfig':
@@ -104,19 +103,19 @@ class EmbedderConfig:
         return cls(
             chunk_size=int(os.getenv("CHUNK_SIZE")),
             chunk_overlap=int(os.getenv("CHUNK_OVERLAP")),
-            max_retries=int(os.getenv("MAX_RETRIES")),
-            retry_delay=int(os.getenv("RETRY_DELAY")),
-            batch_size=int(os.getenv("BATCH_SIZE"))
+            batch_size=int(os.getenv("BATCH_SIZE")),
+            embedding_model=os.getenv("EMBEDDING_MODEL")  # Default to OpenAI if not specified
         )
 
 class DocumentEmbedder:
     def __init__(self, config: EmbedderConfig = None):
         """Initialize the document embedder with configuration."""
         self.config = config or EmbedderConfig.from_env()
-        self._setup_nltk()
+        # self._setup_nltk() - not needed at the moment, uncomment if needed
         self.pc = Pinecone(api_key=os.environ.get("PINECONE_API_KEY"))
         self.index_name = os.getenv("PINECONE_INDEX_NAME")
-        self.embeddings = OpenAIEmbeddings(model="text-embedding-3-large")
+        logger.info(f"Using Pinecone index: {self.index_name}")
+        self._setup_embeddings()
         self._validate_pinecone_index()
         
         # Initialize queues
@@ -141,6 +140,7 @@ class DocumentEmbedder:
         self.total_chunks = 0
         self.chunks_embedded = 0
         self.chunks_uploaded = 0
+        self.progress_thread = None
 
     def _setup_nltk(self) -> None:
         """Set up NLTK punkt data."""
@@ -157,11 +157,31 @@ class DocumentEmbedder:
                 ssl._create_default_https_context = _create_unverified_https_context
             nltk.download("punkt")
 
+    def _setup_embeddings(self) -> None:
+        """Set up the embedding model based on configuration."""
+        logger.info(f"Setting up {self.config.embedding_model} embeddings...")
+        if self.config.embedding_model.lower() == "openai":
+            self.embeddings = OpenAIEmbeddings(model="text-embedding-3-large")
+        elif self.config.embedding_model.lower() == "bge":
+            self.embeddings = HuggingFaceEmbeddings(
+                model_name="BAAI/bge-base-en-v1.5",
+                model_kwargs={'device': 'cpu'},
+                encode_kwargs={'normalize_embeddings': True}
+            )
+        else:
+            raise ValueError(f"Unsupported embedding model: {self.config.embedding_model}")
+        logger.info(f"✅ {self.config.embedding_model} embeddings configured successfully")
+
     def _validate_pinecone_index(self) -> None:
         """Validate that the Pinecone index exists."""
         indexes = self.pc.list_indexes()
         if self.index_name not in [ix.name for ix in indexes]:
             raise ValueError(f"Index '{self.index_name}' not found in Pinecone!")
+            
+        # Get and log index statistics
+        index = self.pc.Index(self.index_name)
+        stats = index.describe_index_stats()
+        logger.info(f"Index stats: {stats}")
 
     def _get_loader_for_pattern(self, pattern: str) -> Any:
         """Get the appropriate loader for the given file pattern."""
@@ -177,16 +197,32 @@ class DocumentEmbedder:
             return None
 
     def _handle_error(self, error: Exception, stage: str, context: str = ""):
-        """Handle errors in the pipeline."""
+        """Handle errors in the pipeline. Only print to console once."""
         error_msg = f"Error in {stage}: {str(error)}\nContext: {context}\n{traceback.format_exc()}"
-        print(f"❌ {error_msg}")
+        logger.error(error_msg)
         self.errors.append(error_msg)
+        # Only print to console the first time
+        if not self.error_event.is_set():
+            print(f"\n❌ Error in {stage}: {str(error)}")
+            if context:
+                print(f"   Context: {context}")
         self.error_event.set()
+        self._clear_queues()
+
+    def _clear_queues(self):
+        """Clear all queues to allow threads to exit."""
+        for queue in [self.read_queue, self.chunk_queue, self.embed_queue]:
+            try:
+                while not queue.empty():
+                    queue.get_nowait()
+                    queue.task_done()
+            except:
+                pass
 
     def _print_progress(self):
         """Print current progress across all stages."""
         # Clear previous lines and move to start
-        print("\033[2K\033[1A" * 3, end="")  # Clear 3 lines and move up
+        print("\033[2K\033[1A" * 4, end="")  # Clear 4 lines and move up
         print("\033[K", end="")  # Clear current line
         
         # Print progress information
@@ -198,22 +234,34 @@ class DocumentEmbedder:
                   f"({(self.chunks_embedded/self.total_chunks)*100:.1f}%), "
                   f"{self.chunks_uploaded}/{self.total_chunks} uploaded "
                   f"({(self.chunks_uploaded/self.total_chunks)*100:.1f}%)")
+        print()  # Add blank line for next update
         
         # Flush to ensure immediate display
         import sys
         sys.stdout.flush()
 
+    def _progress_worker(self):
+        """Worker thread for displaying progress updates."""
+        while not self.error_event.is_set():
+            self._print_progress()
+            time.sleep(2.0)
+
     def _reader_worker(self, file_paths: List[Path]):
         """Read documents and add them to the chunking queue."""
         try:
             self.total_files = len(file_paths)
-            
+
             for file_path in file_paths:
+                if self.error_event.is_set():
+                    logger.info("Reader worker stopping due to error event")
+                    break
+                    
                 try:
                     # Get the appropriate loader for this file
                     loader_class = self._get_loader_for_pattern(file_path.name)
                     if not loader_class:
                         print(f"\n⚠️  No loader found for {file_path}")
+                        logger.warning(f"No loader found for {file_path}")
                         continue
                     
                     # Load the document
@@ -223,20 +271,20 @@ class DocumentEmbedder:
                     # Add to chunking queue
                     self.read_queue.put((file_path, docs))
                     self.files_read += 1
-                    self._print_progress()
                     
                 except Exception as e:
                     error_msg = f"Error reading {file_path}: {str(e)}"
-                    print(f"\n❌ {error_msg}")
-                    self.errors.append(error_msg)
-                    self.error_event.set()
+                    logger.error(error_msg)
+                    self._handle_error(e, "reader", f"Failed to read {file_path}")
+                    break  # Stop reading on error
             
             # Signal end of reading
             self.read_queue.put(None)
             
         except Exception as e:
-            print(f"\n❌ Fatal error in reader: {str(e)}")
-            self.error_event.set()
+            logger.error(f"Fatal error in reader: {str(e)}")
+            self._handle_error(e, "reader", "Fatal error in reader worker")
+        finally:
             self.read_queue.put(None)  # Signal end even if there's an error
 
     def _chunker_worker(self):
@@ -244,10 +292,12 @@ class DocumentEmbedder:
         try:
             while True:
                 if self.error_event.is_set():
+                    logger.info("Chunker worker stopping due to error event")
                     break
                     
                 item = self.read_queue.get()
                 if item is None:  # End signal
+                    logger.info("Chunker worker received end signal")
                     self.read_queue.task_done()
                     break
                     
@@ -257,9 +307,9 @@ class DocumentEmbedder:
                     self.total_chunks += len(chunks)
                     self.chunk_queue.put((file_path, chunks))
                     self.files_chunked += 1
-                    self._print_progress()
                 except Exception as e:
                     self._handle_error(e, "chunker", f"Failed to chunk {file_path}")
+                    break  # Stop chunking on error
                 finally:
                     self.read_queue.task_done()
         finally:
@@ -292,7 +342,6 @@ class DocumentEmbedder:
                         logger.info(f"Batch {batch_count} embedded successfully")
                         self.embed_queue.put((file_path, batch, vectors))
                         self.chunks_embedded += len(batch)
-                        self._print_progress()
                 except Exception as e:
                     logger.error(f"Error embedding batch from {file_path}: {str(e)}")
                     self._handle_error(e, "embedder", f"Failed to embed {file_path}")
@@ -340,7 +389,6 @@ class DocumentEmbedder:
                             vector_store.add_documents(documents=batch, ids=batch_ids)
                             logger.info(f"Batch {batch_count} uploaded successfully")
                             self.chunks_uploaded += len(batch)
-                            self._print_progress()
                         except Exception as e:
                             if "Request size" in str(e) and "exceeds the maximum supported size" in str(e):
                                 logger.warning(f"Batch too large ({current_batch_size}), reducing size and retrying...")
@@ -388,33 +436,37 @@ class DocumentEmbedder:
                 all_files.extend(matching_files)
             
             if not all_files:
-                raise ValueError(f"No files found in {directory} matching patterns: {glob_patterns}")
+                error_msg = f"No files found in {directory} matching patterns: {glob_patterns}"
+                logger.error(error_msg)
+                raise ValueError(error_msg)
             
             # Set total files once
             self.total_files = len(all_files)
             print(f"📁 Found {self.total_files} files to process")
-            # Add blank lines for progress display
             print("\n")
             
             # Start worker threads
             chunker_thread = Thread(target=self._chunker_worker, daemon=True)
             embedder_thread = Thread(target=self._embedder_worker, daemon=True)
             uploader_thread = Thread(target=self._uploader_worker, daemon=True)
+            self.progress_thread = Thread(target=self._progress_worker, daemon=True)
             
             chunker_thread.start()
             embedder_thread.start()
             uploader_thread.start()
+            self.progress_thread.start()
             
             # Start reading in main thread
             self._reader_worker(all_files)
             
-            # Wait for all queues to be processed
-            self.read_queue.join()
-            self.chunk_queue.join()
-            self.embed_queue.join()
+            # Wait for all queues to be processed or error event
+            while any(t.is_alive() for t in [chunker_thread, embedder_thread, uploader_thread]):
+                if self.error_event.is_set():
+                    break
+                time.sleep(0.1)
             
-            # Print final newline after progress
-            print("\n")
+            # Print final progress
+            self._print_progress()
             
             # Check for errors
             if self.error_event.is_set():
@@ -426,15 +478,10 @@ class DocumentEmbedder:
             print("\n✅ All documents processed successfully!")
             
         except Exception as e:
-            print(f"\n❌ Fatal error: {str(e)}")
-            # Ensure we clean up any remaining items in queues
-            for queue in [self.read_queue, self.chunk_queue, self.embed_queue]:
-                try:
-                    while not queue.empty():
-                        queue.get()
-                        queue.task_done()
-                except:
-                    pass
+            if not self.error_event.is_set():
+                print(f"\n❌ Fatal error: {str(e)}")
+            self.error_event.set()  # Signal all threads to stop
+            self._clear_queues()  # Clear queues to allow threads to exit
             raise
 
 def main():
